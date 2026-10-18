@@ -37,5 +37,27 @@ check "Политика входящего трафика — deny" "deny" \
 echo "[3] Учётные записи"
 awk -F: '$3>=1000 && $3<65534 {printf "    %s (uid=%s)\n",$1,$3}' /etc/passwd
 
+echo "[4] Веб-сервер"
+
+# а) служба nginx активна
+check "Служба nginx активна" "active" \
+  "$(systemctl is-active nginx)"
+
+# б) конфигурация nginx синтаксически корректна
+check "Конфигурация nginx корректна" "ok" \
+  "$(sudo nginx -t >/dev/null 2>&1 && echo ok || echo fail)"
+
+# в) сертификат истекает не ранее чем через 30 дней
+check "Сертификат действителен не менее 30 дней" "ok" \
+  "$(sudo openssl x509 -checkend $((30*24*3600)) -noout -in /etc/ssl/certs/devops.crt >/dev/null 2>&1 && echo ok || echo fail)"
+
+# г) нет файлов, доступных на запись всем
+check "Нет файлов, доступных на запись всем" "ok" \
+  "$(find /var/www/devops-site -perm -o+w | grep -q . && echo fail || echo ok)"
+
+# г) права ключа = 600
+check "Права ключа /etc/ssl/private/devops.key = 600" "600" \
+  "$(sudo stat -c '%a' /etc/ssl/private/devops.key)"
+
 echo "Пройдено: $PASS, не пройдено: $FAIL"
 [[ $FAIL -eq 0 ]] && exit 0 || exit 1
