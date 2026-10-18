@@ -59,5 +59,24 @@ check "Нет файлов, доступных на запись всем" "ok" 
 check "Права ключа /etc/ssl/private/devops.key = 600" "600" \
   "$(sudo stat -c '%a' /etc/ssl/private/devops.key)"
 
+
+echo "[5] Контейнеризация"
+
+# а) служба docker активна
+check "Служба docker активна" "active" \
+  "$(systemctl is-active docker)"
+
+# б) контейнер СУБД находится в состоянии healthy
+check "Контейнер СУБД (app-db-1) в состоянии healthy" "healthy" \
+  "$(docker inspect -f '{{.State.Health.Status}}' app-db-1 2>/dev/null || echo 'not_found')"
+
+# в) порты 5000 и 5432 не прослушиваются ни на одном адресе, кроме 127.0.0.1
+check "Порты 5000 и 5432 слушают только 127.0.0.1" "ok" \
+  "$(ss -tln | grep -E ':(5000|5432)\s' | grep -vq '127.0.0.1' && echo 'fail' || echo 'ok')"
+
+# г) права файла ~/app/.env равны 600
+check "Права файла app/.env = 600" "600" \
+  "$(stat -c '%a' "./app/.env" 2>/dev/null || echo 'not_found')"
+
 echo "Пройдено: $PASS, не пройдено: $FAIL"
 [[ $FAIL -eq 0 ]] && exit 0 || exit 1
