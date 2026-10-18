@@ -180,6 +180,72 @@ server {
 }
 ```
 
+## 9. Контейнеризация
+| Параметр | Значение |
+|---|---|
+| **Способ установки Docker Engine** | Официальный репозиторий Docker (`download.docker.com`), пакеты `docker-ce`, `docker-ce-cli`, `containerd.io`, `docker-buildx-plugin`, `docker-compose-plugin`. Пакет `docker.io` из репозитория Ubuntu **не использовался**. |
+| **Версия Docker Engine** | `27.x` (актуальная на момент установки) |
+| **Участники группы `docker`** | Пользователь `devops` (добавлен командой `sudo usermod -aG docker devops`) |
+| **Расположение проекта на сервере** | `/home/devops/app` (содержит `docker-compose.yml`, `Dockerfile`, исходный код) |
+| **Расположение файла `.env`** | `/home/devops/app/.env` |
+| **Права файла `.env`** | `600` (`-rw-------`), владелец `devops:devops` |
+| **Публикуемые порты и адреса** | Приложение: `127.0.0.1:5000` (только локально); PostgreSQL: порт не публикуется (доступен только по имени сервиса внутри Docker-сети) |
+| **Именованные тома** | `app_db_data` (том для хранения данных PostgreSQL) |
+| **Конфигурация обратного прокси** | `location /app/` в `/etc/nginx/sites-available/devops-site`, перенаправление на `http://127.0.0.1:5000/` |
+
+### Установка Docker Engine
+
+```bash
+sudo apt update && sudo apt install -y ca-certificates curl gnupg
+sudo install -m 0755 -d /etc/apt/keyrings
+curl -fsSL https://download.docker.com/linux/ubuntu/gpg | \
+  sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+sudo chmod a+r /etc/apt/keyrings/docker.gpg
+
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] \
+  https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | \
+  sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+
+sudo apt update
+sudo apt install -y docker-ce docker-ce-cli containerd.io \
+  docker-buildx-plugin docker-compose-plugin
+```
+
+Пользователь `devops` добавлен в группу `docker`:
+```bash
+sudo usermod -aG docker devops
+```
+
+### Расположение проекта и файла `.env`
+
+Проект размещён в `/home/devops/app`. Файл `.env` (переменные окружения с паролями СУБД) защищён правами `600` (чтение/запись только для владельца `devops`), чтобы предотвратить утечку секретов.
+
+### Публикуемые порты и адреса
+
+- **Приложение:** публикуется только на `127.0.0.1:5000`, что делает его недоступным из внешней сети напрямую. Nginx обращается к нему как к upstream.
+- **PostgreSQL:** порт не публикуется, доступен контейнерам внутри сети по имени сервиса (`db:5432`).
+
+Прямая публикация на `0.0.0.0:5000` исключена, так как Docker обходит правила UFW.
+
+### Именованные тома
+
+Для сохранения данных PostgreSQL используется именованный том `app_db_data` (создаётся автоматически при первом `docker compose up`, сохраняется при `docker compose down`, удаляется при `down -v`).
+
+### Конфигурация обратного прокси-сервера
+
+В файле `/etc/nginx/sites-available/devops-site` (в блоке `listen 443 ssl`) добавлен `location /app/`:
+
+```nginx
+location /app/ {
+    proxy_pass http://127.0.0.1:5000/;
+    proxy_set_header Host              $host;
+    proxy_set_header X-Real-IP         $remote_addr;
+    proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+}
+```
+Запросы к `https://devops.local/app/` перенаправляются на приложение в контейнере. Статический ресурс по пути `/` сохранён для сценария деплоя в ПР № 12.
+
 ---
 
 ## Приложение А. Команды восстановления после отката на `01-clean-install`
@@ -330,15 +396,56 @@ sudo chmod 644 /etc/ssl/certs/devops.crt
 sudo nginx -t && sudo systemctl reload nginx
 ```
 
-### А.7. Проверка
+### А.7. Установка Docker Engine и запуск приложения
 
 ```bash
-cd ~/devops-course-2026
-./scripts/audit.sh; echo "Код возврата: $?"
+# Установка Docker Engine (официальный репозиторий)
+sudo apt update && sudo apt install -y ca-certificates curl gnupg
+sudo install -m 0755 -d /etc/apt/keyrings
+curl -fsSL https://download.docker.com/linux/ubuntu/gpg | \
+  sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+sudo chmod a+r /etc/apt/keyrings/docker.gpg
 
-# Ожидается: Пройдено: 6, не пройдено: 0; код возврата 0
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] \
+  https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | \
+  sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+
+sudo apt update
+sudo apt install -y docker-ce docker-ce-cli containerd.io \
+  docker-buildx-plugin docker-compose-plugin
+
+# Добавление пользователя devops в группу docker
+sudo usermod -aG docker devops
+
+# Восстановление проекта и конфигурации
+mkdir -p /home/devops/app
+# (здесь подразумевается, что файлы проекта скопированы из резервной копии 
+# или репозитория, как описано в шагах выше)
+
+# Создание файла .env и настройка прав
+cd /home/devops/app
+cp .env.example .env
+chmod 600 .env
+sed -i "s/^POSTGRES_PASSWORD=.*/POSTGRES_PASSWORD=$(openssl rand -hex 16)/" .env
+
+# Запуск контейнеров
+docker compose down -v  # удаление старых томов (если есть)
+docker compose up -d
+```
+
+### А.8. Проверка
+
+```bash
+cd ~
+sudo ./audit.sh; echo "Код возврата: $?"
+
+# Ожидается: Пройдено: 15, не пройдено: 0; код возврата 0
 
 # Проверка nginx
 sudo ss -tlnp | grep nginx        # порты 80 и 443
 curl -k https://devops.local/     # содержимое index.html
+
+# Проверка docker
+docker ps
+curl -s http://127.0.0.1:5000/
 ```
