@@ -248,6 +248,179 @@ location /app/ {
 
 ---
 
+## 10. Ansible
+
+Конфигурация сервера описана декларативно средствами Ansible: плейбук приводит
+чистую VM к целевому состоянию и устраняет ручные расхождения (drift).
+
+### 10.1 Расположение проекта
+
+Проект — каталог `ansible/` в репозитории `devops-course-2026` (ветка `feature/ansible`, merged в `main`):
+
+```
+ansible/
+├── ansible.cfg          # inventory=prod.ini, force_handlers, pipelining
+├── site.yml             # playbook: roles base → ssh → nginx → app
+├── verify.yml           # read-only аудит
+├── requirements.yml     # версии коллекций
+├── inventory/
+│   ├── bootstrap.ini    # student по паролю
+│   └── prod.ini         # devops по ключу
+├── group_vars/
+│   └── all.yml          # app_image, app_tag, порты, имя контейнера
+└── roles/
+    ├── base/  ssh/  nginx/  app/
+```
+
+Все команды выполняются из каталога `ansible/`: `ansible.cfg` использует относительные
+пути (`inventory = inventory/prod.ini`). В WSL репозиторий должен лежать вне `/mnt/c`,
+иначе Ansible игнорирует `ansible.cfg` (`world writable directory`) и `prod.ini` не подключается.
+
+### 10.2 Управляющий и управляемый узлы
+
+| Узел | Система | Роль |
+|---|---|---|
+| Управляющий (control) | Linux / macOS / WSL, ansible-core ≥ 2.16 | Читает inventory, подключается по SSH, выполняет модули |
+| Управляемый (managed) | VM `devops-vm`, Ubuntu Server 24.04 amd64 | Docker, Nginx, контейнер приложения |
+
+Модель — push, постоянный агент не нужен. На VM требуются Python, `python3-debian`
+(для `deb822_repository`) и `python3-requests` (для модулей `community.docker`) — ставит роль `base`.
+Коллекции на управляющем узле:
+
+```bash
+ansible-galaxy collection install -r ansible/requirements.yml
+# ansible.posix 1.6.2, community.docker 4.5.0, community.general 9.5.0
+```
+
+### 10.3 Inventory
+
+Два файла — под два этапа доступа. IP `192.168.56.101` — Host-only адрес VM; при смене адреса обновите оба.
+
+**`ansible/inventory/bootstrap.ini`** — первичный запуск от `student` по паролю:
+
+```ini
+[vm]
+devops-vm ansible_host=192.168.56.101 ansible_port=22 ansible_user=student
+```
+
+**`ansible/inventory/prod.ini`** — повторные запуски от `devops` по ключу, без интерактивного ввода:
+
+```ini
+[vm]
+devops-vm ansible_host=192.168.56.101 ansible_port=22 ansible_user=devops ansible_private_key_file=~/.ssh/devops_vm
+```
+
+### 10.4 Учётные записи bootstrap и prod
+
+| Этап | Пользователь | Аутентификация | Запуск |
+|---|---|---|---|
+| Bootstrap | `student` | Пароль SSH + sudo (`--ask-pass --ask-become-pass`), нужен `sshpass` | `ansible-playbook -i inventory/bootstrap.ini site.yml --ask-pass --ask-become-pass` |
+| Prod | `devops` | SSH-ключ `~/.ssh/devops_vm`, `NOPASSWD`-sudo | `ansible-playbook site.yml` |
+
+Bootstrap создаёт `devops`, ставит его открытый ключ, настраивает `NOPASSWD`-sudo и **только после этого**
+отключает парольную аутентификацию SSH (`/etc/ssh/sshd_config.d/00-ansible-hardening.conf`). Префикс `00-`
+гарантирует обработку раньше `50-cloud-init.conf`, чтобы `PasswordAuthentication yes` не «победил».
+
+> **Безопасность:** `devops ALL=(ALL) NOPASSWD:ALL` удобно для автоматизации, но даёт полный root-доступ
+> без второго подтверждения. В промышленной среде перечень команд ограничивают, а ключ защищают как root-доступ.
+> Пароли и закрытый ключ в репозиторий и документацию не включаются.
+
+> **Bootstrap без `sshpass`:** `ssh-copy-id -i ~/.ssh/devops_vm.pub student@<IP>`, в `bootstrap.ini` добавить
+> `ansible_private_key_file=~/.ssh/devops_vm`, запускать без `--ask-pass` (только `--ask-become-pass`).
+
+### 10.5 Роли и их ответственность
+
+Порядок в `site.yml` обязателен: Docker до контейнера, ключ до отключения паролей, reverse proxy до внешней проверки.
+`become: true` для всего play. В `ansible.cfg` — `force_handlers = True`: уведомлённые handlers SSH/Nginx
+выполняются даже при отказе поздней задачи, иначе конфиг изменён, а служба не перезапущена, и повторный прогон
+вернёт `ok` без вызова handler.
+
+| Роль | Ответственность |
+|---|---|
+| `base` | Проверка Ubuntu 24.04 amd64 (`assert`), базовые пакеты (`ca-certificates`, `curl`, `gnupg`, `python3-debian`, `python3-requests`), репозиторий Docker (`deb822_repository`), установка и запуск Docker Engine |
+| `ssh` | Пользователь `devops` (sudo), `~/.ssh` 0700, authorized key (`ansible.posix.authorized_key`), sudoers с `validate: visudo -cf`, hardening SSH (`validate: sshd -t`), UFW 22/80 tcp, deny incoming / allow outgoing, enable |
+| `nginx` | Пакет Nginx, шаблон `devops-ci-app.conf.j2` → `sites-available`, отключение default, symlink в `sites-enabled`, запуск. Handlers: `nginx -t` (`changed_when: false`) → reload |
+| `app` | `devops` в группе `docker`, pull образа GHCR по SHA (`docker_image`, без `force_source`), контейнер (`docker_container`, `restart_policy: unless-stopped`, публикация `127.0.0.1:5000`), health `/health` (`uri`, `retries: 15`, `until`) |
+
+Docker публикует порты собственными правилами `iptables` раньше UFW, поэтому порт 5000 привязан к `127.0.0.1`:
+защита от обхода Nginx — привязкой, а не межсетевым экраном.
+
+### 10.6 Параметры приложения (`group_vars/all.yml`)
+
+| Переменная | Значение |
+|---|---|
+| `app_image` | `ghcr.io/<login>/devops-ci-app` (owner строчными) |
+| `app_tag` | полный SHA зелёного коммита из ПР № 10 (не `latest`) |
+| `app_container_name` | `devops-ci-app` |
+| `app_host_port` | `5000` (публикуется как `127.0.0.1:5000`) |
+| `app_internal_port` | `5000` |
+
+**Адрес образа GHCR:** `ghcr.io/<login>/devops-ci-app`  
+**Полный SHA:** `<полный-SHA-зелёного-коммита-из-ПР-10>`  
+**Порт контейнера:** `5000` внутренний, публикация `127.0.0.1:5000`  
+**Health endpoint:** `GET /health` → `{"status":"ok"}`, HTTP 200
+
+Новая версия меняется одной переменной `app_tag`; SHA в роли не зашит.
+
+### 10.7 Команды запусков
+
+**Синтаксис и inventory** (до обращения к VM):
+
+```bash
+cd ansible
+ansible-inventory -i inventory/bootstrap.ini --graph
+ansible-inventory --graph
+ansible-playbook -i inventory/bootstrap.ini site.yml --syntax-check
+ansible-playbook site.yml --syntax-check
+```
+
+**Первичный запуск (bootstrap):**
+
+```bash
+ansible-playbook -i inventory/bootstrap.ini site.yml --ask-pass --ask-become-pass
+```
+
+**Повторный запуск (prod, без интерактива):**
+
+```bash
+ansible-playbook site.yml
+```
+
+После первого успешного прогона повторный даёт `changed=0`, `failed=0`; restart SSH и reload Nginx не вызываются.
+
+**Проверка перехода на ключ:**
+
+```bash
+ssh -i ~/.ssh/devops_vm devops@<IP> "whoami && sudo -n true && echo sudo-ok"
+ansible all -m ping
+```
+
+**Внешняя цепочка «клиент → Nginx → контейнер»:**
+
+```bash
+curl --fail http://<IP>/health
+curl --fail http://<IP>/
+```
+
+**Выбор inventory для повтора после сбоя:**
+
+```bash
+ssh -i ~/.ssh/devops_vm -o BatchMode=yes devops@<IP> "sudo -n true" && echo "use prod" || echo "use bootstrap"
+```
+
+### 10.8 Read-only аудит
+
+`ansible/verify.yml` использует тот же `prod.ini`, конфигурацию не меняет — пригоден для CI. Проверяет:
+эффективный SSH (`sshd -T`, `changed_when: false` — команда только читает состояние), запущенность контейнера
+(`docker_container_info`), прямой health на `127.0.0.1:{{ app_host_port }}/health`.
+
+```bash
+ansible-playbook verify.yml
+```
+
+Оба запуска — `changed=0`. При остановленном контейнере аудит падает; состояние восстанавливается `site.yml`.
+
+
 ## Приложение А. Команды восстановления после отката на `01-clean-install`
 
 > Выполнять по порядку под пользователем с правами `sudo`.
