@@ -1,0 +1,6 @@
+---
+app_image: "ghcr.io/egorven/devops-ci-app"
+app_tag: "a2e44485d7d454acb4166423227000878706c0e0"
+app_container_name: "devops-ci-app"
+app_host_port: 5000
+app_internal_port: 5000
